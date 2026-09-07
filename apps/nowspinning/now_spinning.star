@@ -1,7 +1,7 @@
 """
 Applet: Now Spinning
 Summary: Showcase your music
-Description: Displays the name and cover of an artist's album. Not connected to any music service, you need to manually change the album. Type the album name to view available options, include the artist's name to help refine results.
+Description: Displays the name and cover of an artist's album. Not connected to any music service, you need to manually change the album. Type an album or artist name to view available options.
 Author: Daniel Sitnik
 """
 
@@ -24,6 +24,54 @@ DEFAULT_HIDE_APP = False
 DEFAULT_USER_AGENT = "Tidbyt/1.0.0 ( https://www.tidbyt.dev )"
 
 COVER_CACHE_TTL = 86400  # 1 day
+
+# release types that are not an album you would want to show a cover for
+EXCLUDED_SECONDARY_TYPES = [
+    "live",
+    "interview",
+    "audiobook",
+    "spokenword",
+    "demo",
+    "remix",
+    "dj-mix",
+    "mixtape/street",
+]
+
+# titles and artists containing these are karaoke, tribute or cover band releases
+UNWANTED_MARKERS = [
+    "karaoke",
+    "tribute",
+    "in the style of",
+    "made popular by",
+    "made famous by",
+    "originally performed",
+    "cover band",
+    "string quartet",
+    "lullaby renditions",
+]
+
+# characters that have a special meaning in a MusicBrainz (Lucene) query
+LUCENE_SPECIAL_CHARS = [
+    "\\",
+    "+",
+    "-",
+    "&",
+    "|",
+    "!",
+    "(",
+    ")",
+    "{",
+    "}",
+    "[",
+    "]",
+    "^",
+    '"',
+    "~",
+    "*",
+    "?",
+    ":",
+    "/",
+]
 
 DEBUG = False
 
@@ -218,7 +266,7 @@ def get_schema():
             schema.Typeahead(
                 id = "album",
                 name = "Album",
-                desc = "Name of the album (add artist to refine).",
+                desc = "Name of the album or the artist.",
                 icon = "compactDisc",
                 handler = album_search,
             ),
@@ -272,8 +320,12 @@ def get_schema():
 def album_search(album_name):
     """Searches for albums based on a name.
 
+    The term is matched against both the release group title and the artist
+    name, so typing just an artist returns that artist's albums instead of
+    unrelated releases that merely mention them in their title.
+
     Args:
-        album_name (str): The album name to search.
+        album_name (str): The album or artist name to search.
 
     Returns:
         schema.Option[]: List of album options for the user to pick.
@@ -290,7 +342,7 @@ def album_search(album_name):
         return []
 
     # build url
-    url = "https://musicbrainz.org/ws/2/release-group/?query=releasegroup:{}%20AND%20status:official&limit=50&fmt=json".format(humanize.url_encode(stripped_name))
+    url = "https://musicbrainz.org/ws/2/release-group/?query={}&limit=50&fmt=json".format(humanize.url_encode(build_query(stripped_name)))
     dprint("Calling %s" % url)
     res = http.get(url, headers = {
         "User-Agent": DEFAULT_USER_AGENT,
@@ -317,8 +369,11 @@ def album_search(album_name):
 
     dprint("Found %d albums" % len(data["release-groups"]))
 
-    # sort by release date, newest first
-    sorted_releases = sorted(data["release-groups"], key = get_release_date, reverse = True)
+    # drop karaoke, tribute and cover band releases, unless that is what was asked for
+    releases = [r for r in data["release-groups"] if not is_unwanted(r, stripped_name)]
+
+    # best match first, newest first between equally good matches
+    sorted_releases = sorted(releases, key = get_rank, reverse = True)
 
     options = []
     for release in sorted_releases:
@@ -334,13 +389,78 @@ def album_search(album_name):
 
     return options
 
-def get_release_date(release):
-    """Returns the year of a release.
+def build_query(term):
+    """Builds the MusicBrainz Lucene query for a search term.
+
+    The term is looked up as a phrase in the artist and title fields first, then
+    as loose words, so "radiohead" finds Radiohead's albums while
+    "ok computer radiohead" still finds that one album.
 
     Args:
-        release (dict): The release object.
+        term (str): The raw search term typed by the user.
+
+    Returns:
+        str: The query to send to MusicBrainz.
     """
-    return release.get("first-release-date", "0000")[0:4]
+
+    escaped = lucene_escape(term)
+
+    # match the artist first, then the title, then any of the words
+    matches = '(artist:"{0}"^10 OR releasegroup:"{0}"^5 OR artist:({0}) OR releasegroup:({0}))'.format(escaped)
+
+    # only released albums, no singles, live bootlegs, remixes or interviews
+    filters = ["status:official", "primarytype:album"]
+    for secondary_type in EXCLUDED_SECONDARY_TYPES:
+        filters.append('-secondarytype:"{}"'.format(secondary_type))
+
+    return "{} AND {}".format(matches, " AND ".join(filters))
+
+def lucene_escape(term):
+    """Escapes Lucene syntax characters so they are searched literally.
+
+    Args:
+        term (str): The raw search term typed by the user.
+
+    Returns:
+        str: The term safe to embed in a query.
+    """
+
+    escaped = term
+    for char in LUCENE_SPECIAL_CHARS:
+        escaped = escaped.replace(char, "\\" + char)
+    return escaped
+
+def is_unwanted(release, term):
+    """Checks if a release is a karaoke, tribute or cover band version.
+
+    Args:
+        release (dict): The release group object.
+        term (str): The search term, so these can still be found on purpose.
+
+    Returns:
+        bool: True if the release should be hidden.
+    """
+
+    haystack = "{} {}".format(release["title"], release["artist-credit"][0]["name"]).lower()
+    lowered_term = term.lower()
+
+    for marker in UNWANTED_MARKERS:
+        if marker in haystack and marker not in lowered_term:
+            return True
+
+    return False
+
+def get_rank(release):
+    """Returns the sort key of a release: relevance first, then recency.
+
+    Args:
+        release (dict): The release group object.
+
+    Returns:
+        tuple: The match score and the release year.
+    """
+
+    return (int(release.get("score", 0)), release.get("first-release-date", "0000")[0:4])
 
 def dprint(message):
     """Prints messages when in debug mode.
