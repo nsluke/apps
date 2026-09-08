@@ -47,9 +47,11 @@ SLAM_HEADERS = {"User-Agent": SLAM_UA}
 
 # Australian Open and Roland Garros publish elsewhere; until those paths are
 # known the app simply stays on the tour scoreboard for them.
+# Each entry also carries the months its tournament can run in, so the app does
+# not spend two requests a render probing dead feeds for the other ten months.
 SLAM_FEEDS = [
-    ["https://www.usopen.org/en_US/scores/feeds/", "US OPEN", HARD],
-    ["https://www.wimbledon.com/en_GB/scores/feeds/", "WIMBLEDON", GRASS],
+    ["https://www.usopen.org/en_US/scores/feeds/", "US OPEN", HARD, [8, 9]],
+    ["https://www.wimbledon.com/en_GB/scores/feeds/", "WIMBLEDON", GRASS, [6, 7]],
 ]
 
 # Wimbledon calls them Gentlemen's and Ladies'; everyone else says Men's and
@@ -626,13 +628,15 @@ def player_state(events, guid, slugs, quals):
 
 # ------------------------------------------------------- slam point by point
 
-def slam_live(year):
+def slam_live(year, month):
     """The slam currently on court, or None.
 
     A finished tournament keeps serving its final board for months, so the test
     has to be "is anyone playing", not "is the list non-empty".
     """
     for feed in SLAM_FEEDS:
+        if month not in feed[3]:
+            continue
         d = get_json(feed[0] + str(year) + "/matches/live/scores.json", TTL_PBP, SLAM_HEADERS)
         if type(d) != "dict":
             continue
@@ -813,7 +817,7 @@ def slam_page(name, colour, match, point, sq):
     return render.Column(children = kids)
 
 def slam_mode(tours, doubles, guid_name, sq, speed, now):
-    live = slam_live(now.year)
+    live = slam_live(now.year, now.month)
     if live == None:
         return None
     base, name, colour, matches = live[0], live[1], live[2], live[3]
