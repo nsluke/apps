@@ -152,39 +152,63 @@ def clip(s, n):
         return s
     return s[0:n]
 
-def scores_row(vals, color):
+def plain(items):
+    """Wrap bare strings (kick-off times) as cells with no set winner."""
+    return [[t, None] for t in items]
+
+def cell_gap(cells):
+    # A five-set match needs all five columns, so the gap tightens rather than
+    # the earliest set being dropped.
+    return 1 if len(cells) > 3 else 2
+
+def scores_row(cells, color):
     kids = []
-    for v in vals:
-        kids.append(render.Padding(pad = (2, 0, 0, 0), child = render.Text(v, font = TT, color = color)))
+    gap = cell_gap(cells)
+    for cell in cells:
+        won = cell[1]
+        if won == True:
+            ink = WHITE
+        elif won == False:
+            ink = DIM
+        else:
+            ink = color
+        kids.append(render.Padding(pad = (gap, 0, 0, 0), child = render.Text(cell[0], font = TT, color = ink)))
     return render.Row(children = kids)
 
-def score_width(vals):
+def score_width(cells):
     w = 0
-    for v in vals:
-        w += 2 + 4 * len(v)
+    gap = cell_gap(cells)
+    for cell in cells:
+        w += gap + 4 * len(cell[0])
     return w
 
-def player_row(name, vals, color, serving):
-    budget = max(5, (61 - score_width(vals)) // 4)
+def player_row(name, cells, color, serving):
+    # Reserve a few pixels so a long surname never runs flush into the scores.
+    budget = max(5, (58 - score_width(cells)) // 4)
     return render.Row(
         expanded = True,
         main_align = "space_between",
         children = [
             render.Text(clip(name, budget), font = TT, color = GREEN if serving else color),
-            scores_row(vals, color),
+            scores_row(cells, color),
         ],
     )
 
 # ---------------------------------------------------------------- data shaping
 
 def sets_of(competitor):
+    """Every set played, each carrying its own winner flag.
+
+    A men's slam match runs to five sets, so nothing is truncated - the set in
+    progress has no winner yet and keeps the row colour.
+    """
     out = []
     for ls in (competitor.get("linescores") or []):
         v = ls.get("value")
         if v == None:
             continue
-        out.append(str(int(v)))
-    return out[-4:]
+        out.append([str(int(v)), ls.get("winner")])
+    return out
 
 def serving(competitor):
     return competitor.get("possession") == True
@@ -224,7 +248,7 @@ def match_widget(comp, mode, tz):
 
     if mode == "sched":
         return render.Column(children = [
-            player_row(short_name(a), [hhmm(comp.get("date", ""), tz)], DIM, False),
+            player_row(short_name(a), plain([hhmm(comp.get("date", ""), tz)]), DIM, False),
             player_row(short_name(b), [], DIM, False),
         ])
 
