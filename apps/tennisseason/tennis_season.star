@@ -16,6 +16,10 @@ BASE = "https://site.api.espn.com/apis/site/v2/sports/tennis/"
 CORE = "https://sports.core.api.espn.com/v2/sports/tennis/leagues/atp/events/"
 
 TTL_LIVE = 300
+
+# The slam feeds are small and change every few seconds; the match list and the
+# point must come from the same moment or the two halves of the page disagree.
+TTL_PBP = 45
 TTL_DAY = 3600
 TTL_RANK = 43200
 TTL_SLAM = 604800
@@ -33,6 +37,37 @@ BLACK = "#000000"
 RULE = "#2A2622"
 TT = "tom-thumb"
 
+# The Grand Slam sites publish IBM SlamTracker as plain, keyless JSON. During a
+# slam it is both richer than the tour scoreboard (point scores, aces, serve
+# speed) and ~200x smaller, so it is preferred while it has anything to say.
+# It rejects a default user agent with an HTTP/2 stream reset, which Starlark
+# cannot catch, so every request below carries a browser UA.
+SLAM_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0 Safari/537.36"
+SLAM_HEADERS = {"User-Agent": SLAM_UA}
+
+# Australian Open and Roland Garros publish elsewhere; until those paths are
+# known the app simply stays on the tour scoreboard for them.
+SLAM_FEEDS = [
+    ["https://www.usopen.org/en_US/scores/feeds/", "US OPEN", HARD],
+    ["https://www.wimbledon.com/en_GB/scores/feeds/", "WIMBLEDON", GRASS],
+]
+
+# Wimbledon calls them Gentlemen's and Ladies'; everyone else says Men's and
+# Women's. Listing both keeps the juniors, wheelchair and invitation draws out.
+SLAM_SINGLES = {
+    "Men's Singles": "atp",
+    "Gentlemen's Singles": "atp",
+    "Women's Singles": "wta",
+    "Ladies' Singles": "wta",
+}
+SLAM_DOUBLES = {
+    "Men's Doubles": "atp",
+    "Gentlemen's Doubles": "atp",
+    "Women's Doubles": "wta",
+    "Ladies' Doubles": "wta",
+    "Mixed Doubles": "both",
+}
+
 SINGLES = {"atp": "mens-singles", "wta": "womens-singles"}
 DOUBLES = {"atp": "mens-doubles", "wta": "womens-doubles"}
 
@@ -46,7 +81,7 @@ MONTHS = ["JANUARY", "FEBRUARY", "MARCH", "APRIL", "MAY", "JUNE", "JULY", "AUGUS
 
 # ---------------------------------------------------------------- fetching
 
-def get_json(url, ttl):
+def get_json(url, ttl, headers = {}):
     """Fetch and decode JSON.
 
     A transport error inside http.get aborts the whole render with no way to
@@ -63,7 +98,7 @@ def get_json(url, ttl):
         return None
 
     cache.set(gate, "try", ttl_seconds = 600)
-    resp = http.get(url = url, ttl_seconds = ttl)
+    resp = http.get(url = url, ttl_seconds = ttl, headers = headers)
     cache.set(gate, "ok", ttl_seconds = 5)
 
     if resp.status_code != 200:
@@ -164,6 +199,7 @@ def cell_gap(cells):
 def scores_row(cells, color):
     kids = []
     gap = cell_gap(cells)
+    first = True
     for cell in cells:
         won = cell[1]
         if won == True:
@@ -172,14 +208,17 @@ def scores_row(cells, color):
             ink = DIM
         else:
             ink = color
-        kids.append(render.Padding(pad = (gap, 0, 0, 0), child = render.Text(cell[0], font = TT, color = ink)))
+        kids.append(render.Padding(pad = (0 if first else gap, 0, 0, 0), child = render.Text(cell[0], font = TT, color = ink)))
+        first = False
     return render.Row(children = kids)
 
 def score_width(cells):
     w = 0
     gap = cell_gap(cells)
     for cell in cells:
-        w += gap + 4 * len(cell[0])
+        w += 4 * len(cell[0])
+    if len(cells) > 1:
+        w += gap * (len(cells) - 1)
     return w
 
 def player_row(name, cells, color, serving):
@@ -585,6 +624,236 @@ def player_state(events, guid, slugs, quals):
         return "advanced", last[0], last[1]
     return "out", last[0], last[1]
 
+# ------------------------------------------------------- slam point by point
+
+def slam_live(year):
+    """The slam currently on court, or None.
+
+    A finished tournament keeps serving its final board for months, so the test
+    has to be "is anyone playing", not "is the list non-empty".
+    """
+    for feed in SLAM_FEEDS:
+        d = get_json(feed[0] + str(year) + "/matches/live/scores.json", TTL_PBP, SLAM_HEADERS)
+        if type(d) != "dict":
+            continue
+        matches = d.get("matches")
+        if type(matches) != "list":
+            continue
+        playing = []
+        for m in matches:
+            if type(m) == "dict" and (m.get("status") or "") == "In Progress":
+                playing.append(m)
+        if len(playing) > 0:
+            return [feed[0], feed[1], feed[2], playing]
+    return None
+
+def slam_eligible(match, tours, doubles):
+    name = match.get("eventName") or ""
+    if name in SLAM_SINGLES:
+        return SLAM_SINGLES[name] in tours
+    if doubles and name in SLAM_DOUBLES:
+        want = SLAM_DOUBLES[name]
+        return want == "both" or want in tours
+    return False
+
+def slam_point(base, year, match_id):
+    """The most recent point. The rolling feed is ~5KB and holds the last few."""
+    d = get_json(base + str(year) + "/slamtracker/history/" + match_id + "U.json", TTL_PBP, SLAM_HEADERS)
+    if type(d) != "list" or len(d) == 0:
+        return None
+    return d[-1]
+
+def set_result(mine, theirs):
+    """Who took a set, from the two game counts. None while it is still live."""
+    if not mine.isdigit() or not theirs.isdigit():
+        return None
+    a = int(mine)
+    b = int(theirs)
+    if a >= 6 and a - b >= 2:
+        return True
+    if b >= 6 and b - a >= 2:
+        return False
+    if a == 7:
+        return True
+    if b == 7:
+        return False
+    return None
+
+def slam_sets(match, idx):
+    out = []
+    for s in ((match.get("scores") or {}).get("sets") or []):
+        if len(s) < 2:
+            continue
+        mine = s[idx].get("scoreDisplay")
+        theirs = s[1 - idx].get("scoreDisplay")
+        if mine == None:
+            continue
+        out.append([mine, set_result(mine, theirs or "")])
+    return out
+
+def serving_team(point, pairs):
+    """Which side is serving, as 1, 2 or 0.
+
+    PointServer numbers the individual player, so in doubles it runs 1-4 with
+    the first pair taking 1 and 2 - a bare "is it 2?" test only works for
+    singles.
+    """
+    raw = txt((point or {}).get("PointServer"), "0")
+    if not raw.isdigit():
+        return 0
+    n = int(raw)
+    if n < 1:
+        return 0
+    if pairs:
+        return 1 if n <= 2 else 2
+    if n <= 2:
+        return n
+    return 0
+
+def slam_name(team):
+    """Singles gets the full surname; a doubles pair has to share the row."""
+    a = surname(team.get("displayNameA") or "?")
+    b = team.get("displayNameB")
+    if b == None or b == "":
+        return a
+    return a[0:4] + "/" + surname(b)[0:4]
+
+def txt(value, fallback):
+    """A feed key can be present carrying JSON null, which returns None from
+    .get(key, default) rather than the default - so coerce every read."""
+    if type(value) != "string" or value == "":
+        return fallback
+    return value
+
+def flag(point, name):
+    """Flags are player-indexed strings: "0" none, "1"/"2" the player."""
+    return txt(point.get(name), "0")
+
+def point_event(point):
+    """The most newsworthy thing about the last point.
+
+    Every flag is player-indexed rather than boolean: "0" means it did not
+    happen, "1" and "2" name the player it happened to.
+    """
+    if point == None:
+        return "", DIM
+    if flag(point, "MatchWinner") != "0":
+        return "MATCH", AMBER
+    if flag(point, "SetWinner") != "0":
+        return "SET", AMBER
+    if flag(point, "Ace") != "0":
+        mph = txt(point.get("Speed_MPH"), "0")
+        if mph != "0":
+            return "ACE " + mph, GREEN
+        return "ACE", GREEN
+    if flag(point, "DoubleFault") != "0":
+        return "DBL FAULT", SUSPEND
+    if flag(point, "BreakPointWon") != "0":
+        return "BREAK", AMBER
+    if flag(point, "BreakPoint") != "0":
+        return "BREAK PT", AMBER
+    if flag(point, "GameWinner") != "0":
+        return "GAME", WHITE
+    if flag(point, "Winner") != "0":
+        return "WINNER", WHITE
+    if flag(point, "UnforcedError") != "0":
+        return "ERROR", DIM
+    return "", DIM
+
+def game_score(point):
+    if point == None:
+        return ""
+    a = txt(point.get("P1Score"), "")
+    b = txt(point.get("P2Score"), "")
+    if a == "" or b == "":
+        return ""
+    return a + "-" + b
+
+def slam_page(name, colour, match, point, sq):
+    t1 = match.get("team1") or {}
+    t2 = match.get("team2") or {}
+    pairs = (t1.get("displayNameB") or "") != ""
+    server = serving_team(point, pairs)
+    kids = [bar(clip(name, 11), match.get("roundNameShort") or "", colour, WHITE)]
+    kids.append(render.Padding(pad = (1, 1, 1, 0), child = render.Column(children = [
+        player_row(slam_name(t1), slam_sets(match, 0), WHITE, server == 1),
+        player_row(slam_name(t2), slam_sets(match, 1), WHITE, server == 2),
+    ])))
+
+    event, ink = point_event(point)
+    kids.append(render.Padding(pad = (2, 1, 1, 0), child = render.Row(
+        expanded = True,
+        main_align = "space_between",
+        children = [
+            render.Text(game_score(point), font = TT, color = AMBER),
+            render.Text(clip(event, 12), font = TT, color = ink),
+        ],
+    )))
+
+    if sq and point != None:
+        kids.append(divider(2))
+
+        # Serve detail first, then the commentary clipped to the room that is
+        # left - a long sentence must never push the line below it off-panel.
+        serve = txt(point.get("ServeNumber"), "0")
+        mph = txt(point.get("Speed_MPH"), "0")
+        if serve != "0" and mph != "0":
+            ordinal = "1ST" if serve == "1" else "2ND"
+            kids.append(line(mph + " MPH ON " + ordinal, AMBER, 2))
+        sentence = txt(point.get("Sentence"), "")
+        if sentence != "":
+            kids.append(render.Padding(pad = (2, 2, 2, 0), child = render.WrappedText(
+                content = sentence,
+                width = 60,
+                height = 21,
+                font = TT,
+                color = DIM,
+                linespacing = 1,
+            )))
+    return render.Column(children = kids)
+
+def slam_mode(tours, doubles, guid_name, sq, speed, now):
+    live = slam_live(now.year)
+    if live == None:
+        return None
+    base, name, colour, matches = live[0], live[1], live[2], live[3]
+
+    picked = []
+    for m in matches:
+        if slam_eligible(m, tours, doubles):
+            picked.append(m)
+    if len(picked) == 0:
+        return None
+
+    # Following someone narrows the screen to their match. If they are not on
+    # court, hand back to the tour scoreboard rather than showing strangers -
+    # only that path knows whether they are up next or already out.
+    if guid_name != "":
+        mine = []
+        for m in picked:
+            t1 = slam_name(m.get("team1") or {})
+            t2 = slam_name(m.get("team2") or {})
+            if t1 == guid_name or t2 == guid_name:
+                mine.append(m)
+        if len(mine) == 0:
+            return None
+        picked = mine
+
+    # Every page costs a request and pixlet drops any animation past 15s, so
+    # the page count follows the time budget rather than the panel size.
+    cap = 15 // int(speed)
+    if cap > (4 if sq else 3):
+        cap = 4 if sq else 3
+    if cap < 1:
+        cap = 1
+    pages = []
+    for m in picked[0:cap]:
+        point = slam_point(base, now.year, m.get("match_id") or "")
+        pages.append(slam_page(name, colour, m, point, sq))
+    if len(pages) == 0:
+        return None
+    return render.Root(delay = int(speed) * 1000, child = render.Animation(children = pages))
+
 # ---------------------------------------------------------------- main
 
 def main(config):
@@ -609,8 +878,6 @@ def main(config):
     speed = config.str("speed", "4")
     slugs = wanted_slugs(tours, doubles)
 
-    running, ahead, days = gather(tours, slams_only, now_iso)
-
     follow = config.get("player")
     guid = ""
     who = ""
@@ -622,6 +889,15 @@ def main(config):
             if len(bits) >= 2:
                 guid = bits[0]
                 who = surname(bits[1])
+
+    # A Grand Slam publishes point-by-point, which beats anything the tour
+    # scoreboard carries, so take it whenever there is something on court.
+    if config.bool("pbp", True):
+        slam = slam_mode(tours, doubles, who, sq, speed, now)
+        if slam != None:
+            return slam
+
+    running, ahead, days = gather(tours, slams_only, now_iso)
 
     # --- a followed player takes priority over everything else
     if guid != "" and len(running) > 0:
@@ -748,6 +1024,13 @@ def get_schema():
                     schema.Option(display = "Show the tournament", value = "tournament"),
                     schema.Option(display = "Show nothing", value = "quiet"),
                 ],
+            ),
+            schema.Toggle(
+                id = "pbp",
+                name = "Point by point",
+                desc = "During a Grand Slam, show the live point score and what just happened.",
+                icon = "tableTennisPaddleBall",
+                default = True,
             ),
             schema.Toggle(
                 id = "quals",
